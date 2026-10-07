@@ -2,93 +2,309 @@ import torch
 import torch.nn as nn
 import timm
 
+
 class SpatialTemporalXceptionBiLSTM(nn.Module):
-    def __init__(self, sequence_length=15, lstm_hidden_size=256, lstm_layers=2):
-        super(SpatialTemporalXceptionBiLSTM, self).__init__()
-        
+    """
+    Mô hình phát hiện Deepfake kết hợp:
+
+        Xception
+            ↓
+        Spatial Feature
+            ↓
+        Bi-LSTM
+            ↓
+        Temporal Feature
+            ↓
+        Fully Connected Classifier
+            ↓
+        Real / Fake Logit
+    """
+
+    def __init__(
+        self,
+        sequence_length=15,
+        lstm_hidden_size=256,
+        lstm_layers=2
+    ):
+
+        super().__init__()
+
         self.seq_len = sequence_length
-        
-        # -------------------------------------------------------------
-        # 1. SPATIAL FEATURE EXTRACTOR: Xception (Pre-trained ImageNet)
-        # -------------------------------------------------------------
-        # Tải mô hình Xception, bỏ lớp Fully Connected phân loại cuối (num_classes=0)
-        self.spatial_extractor = timm.create_model('legacy_xception', pretrained=True, num_classes=0)
-        
-        # Đóng băng trọng số Xception (Freeze Weights) để chống overfitting và tăng tốc huấn luyện
+
+        # =====================================================
+        # 1. XCEPTION
+        # =====================================================
+        self.spatial_extractor = timm.create_model(
+            "legacy_xception",
+            pretrained=True,
+            num_classes=0
+        )
+
+        # -----------------------------------------------------
+        # Freeze toàn bộ Xception
+        # -----------------------------------------------------
         for param in self.spatial_extractor.parameters():
             param.requires_grad = False
-            
-        feature_dim = self.spatial_extractor.num_features # 2048 chiều
-        
-        # -------------------------------------------------------------
-        # 2. TEMPORAL FEATURE PROCESSOR: Bi-LSTM
-        # -------------------------------------------------------------
-        self.bi_lstm = nn.LSTM(
-            input_size=feature_dim,     # Đầu vào: 2048
-            hidden_size=lstm_hidden_size,# Kích thước hidden state: 256
-            num_layers=lstm_layers,     # Số lớp LSTM xếp chồng: 2
-            batch_first=True,
-            bidirectional=True,         # Hai chiều (Forward + Backward)
-            dropout=0.5                 # Anti-overfitting
-        )
-        
-        # -------------------------------------------------------------
-        # 3. CLASSIFIER HEAD: Fully Connected Layers
-        # -------------------------------------------------------------
-        # Bi-LSTM 2 chiều nên kích thước đầu ra là hidden_size * 2 = 512
-        self.classifier = nn.Sequential(
-            nn.Linear(lstm_hidden_size * 2, 128),
-            nn.ReLU(),
-            nn.Dropout(0.5),
-            nn.Linear(128, 1) # Đưa ra Logit phục vụ hàm Binary Cross-Entropy Loss
+
+        # -----------------------------------------------------
+        # Số chiều feature đầu ra
+        # -----------------------------------------------------
+        feature_dim = self.spatial_extractor.num_features
+
+        print(
+            f"[MODEL] Xception feature dimension: "
+            f"{feature_dim}"
         )
 
+        # =====================================================
+        # 2. BI-LSTM
+        # =====================================================
+        self.bi_lstm = nn.LSTM(
+
+            input_size=feature_dim,
+
+            hidden_size=lstm_hidden_size,
+
+            num_layers=lstm_layers,
+
+            batch_first=True,
+
+            bidirectional=True,
+
+            dropout=0.5 if lstm_layers > 1 else 0.0
+        )
+
+        # =====================================================
+        # 3. CLASSIFIER
+        # =====================================================
+        self.classifier = nn.Sequential(
+
+            nn.Linear(
+                lstm_hidden_size * 2,
+                128
+            ),
+
+            nn.ReLU(),
+
+            nn.Dropout(0.5),
+
+            nn.Linear(
+                128,
+                1
+            )
+        )
+
+        # -----------------------------------------------------
+        # Đảm bảo backbone ở eval mode ngay từ đầu
+        # -----------------------------------------------------
+        self.spatial_extractor.eval()
+
+    # =========================================================
+    # OVERRIDE TRAIN
+    # =========================================================
+    def train(self, mode=True):
+
+        # Cho toàn bộ model vào train/eval
+        super().train(mode)
+
+        # -----------------------------------------------------
+        # QUAN TRỌNG:
+        # Xception vẫn luôn ở eval mode
+        # -----------------------------------------------------
+        self.spatial_extractor.eval()
+
+        return self
+
+    # =========================================================
+    # FORWARD
+    # =========================================================
     def forward(self, x):
-        """
-        :param x: Input Tensor shape (Batch_Size, Sequence_Length, Channels, Height, Width)
-                  Ví dụ: (B, 15, 3, 224, 224)
-        """
-        batch_size, seq_len, c, h, w = x.size()
-        
-        # Bước 1: Gộp Batch và Sequence để đưa vào mạng CNN trích xuất cùng lúc
-        # Shape: (B * 15, 3, 224, 224)
-        x_reshaped = x.view(batch_size * seq_len, c, h, w)
-        
-        # Trích xuất đặc trưng không gian qua Xception
-        # Shape: (B * 15, 2048)
-        spatial_features = self.spatial_extractor(x_reshaped)
-        
-        # Bước 2: Tách lại về dạng chuỗi thời gian cho Bi-LSTM
-        # Shape: (B, 15, 2048)
-        spatial_features = spatial_features.view(batch_size, seq_len, -1)
-        
-        # Bước 3: Truyền qua Bi-LSTM
-        # lstm_out shape: (B, 15, 512)
-        lstm_out, _ = self.bi_lstm(spatial_features)
-        
-        # Bước 4: Temporal Pooling (Lấy trung bình đặc trưng của 15 khung hình)
-        # Shape: (B, 512)
-        aggregated_features = torch.mean(lstm_out, dim=1)
-        
-        # Bước 5: Phân loại Real/Fake
-        # Logits shape: (B, 1)
-        logits = self.classifier(aggregated_features)
-        
+
+        # -----------------------------------------------------
+        # Kiểm tra shape đầu vào
+        # -----------------------------------------------------
+        if x.ndim != 5:
+
+            raise ValueError(
+                "Input phải có 5 chiều: "
+                "(B, T, C, H, W)"
+            )
+
+        batch_size, seq_len, channels, height, width = x.shape
+
+        # -----------------------------------------------------
+        # Kiểm tra sequence length
+        # -----------------------------------------------------
+        if seq_len != self.seq_len:
+
+            raise ValueError(
+                f"Sequence length không đúng. "
+                f"Model yêu cầu {self.seq_len}, "
+                f"nhưng nhận {seq_len}."
+            )
+
+        # =====================================================
+        # STEP 1: CNN
+        # =====================================================
+
+        # (B,T,C,H,W)
+        #      ↓
+        # (B*T,C,H,W)
+        x = x.reshape(
+            batch_size * seq_len,
+            channels,
+            height,
+            width
+        )
+
+        # -----------------------------------------------------
+        # Xception frozen:
+        # Không cần tạo computational graph
+        # -----------------------------------------------------
+        with torch.no_grad():
+
+            spatial_features = (
+                self.spatial_extractor(x)
+            )
+
+        # Shape:
+        # (B*T, 2048)
+
+        # =====================================================
+        # STEP 2: RESTORE TEMPORAL DIMENSION
+        # =====================================================
+
+        spatial_features = spatial_features.reshape(
+
+            batch_size,
+            seq_len,
+            -1
+        )
+
+        # Shape:
+        # (B,T,2048)
+
+        # =====================================================
+        # STEP 3: BI-LSTM
+        # =====================================================
+
+        lstm_out, _ = self.bi_lstm(
+            spatial_features
+        )
+
+        # Shape:
+        # (B,T,512)
+
+        # =====================================================
+        # STEP 4: TEMPORAL POOLING
+        # =====================================================
+
+        aggregated_features = torch.mean(
+            lstm_out,
+            dim=1
+        )
+
+        # Shape:
+        # (B,512)
+
+        # =====================================================
+        # STEP 5: CLASSIFIER
+        # =====================================================
+
+        logits = self.classifier(
+            aggregated_features
+        )
+
+        # Shape:
+        # (B,1)
+
         return logits
 
-# ----------------- CODE KIỂM TRA LUỒNG DỮ LIỆU (TEST RUN) -----------------
-if __name__ == '__main__':
-    print("[INFO] Khởi tạo mô hình Xception + Bi-LSTM...")
-    model = SpatialTemporalXceptionBiLSTM(sequence_length=15)
+
+# =============================================================
+# TEST MODEL
+# =============================================================
+if __name__ == "__main__":
+
+    print(
+        "\n[INFO] Khởi tạo Xception + Bi-LSTM..."
+    )
+
+    device = torch.device(
+        "cuda"
+        if torch.cuda.is_available()
+        else "cpu"
+    )
+
+    print(
+        f"[INFO] Device: {device}"
+    )
+
+    model = SpatialTemporalXceptionBiLSTM(
+        sequence_length=15,
+        lstm_hidden_size=256,
+        lstm_layers=2
+    )
+
+    model = model.to(device)
+
+    # ---------------------------------------------------------
+    # Kiểm tra số parameter
+    # ---------------------------------------------------------
+    total_params = sum(
+        p.numel()
+        for p in model.parameters()
+    )
+
+    trainable_params = sum(
+        p.numel()
+        for p in model.parameters()
+        if p.requires_grad
+    )
+
+    print(
+        f"[INFO] Tổng parameters: "
+        f"{total_params:,}"
+    )
+
+    print(
+        f"[INFO] Trainable parameters: "
+        f"{trainable_params:,}"
+    )
+
+    # ---------------------------------------------------------
+    # Dummy input
+    # ---------------------------------------------------------
+    dummy_input = torch.randn(
+        2,
+        15,
+        3,
+        224,
+        224,
+        device=device
+    )
+
+    print(
+        f"[INFO] Input shape: "
+        f"{dummy_input.shape}"
+    )
+
+    # ---------------------------------------------------------
+    # Forward test
+    # ---------------------------------------------------------
     model.eval()
-    
-    # Giả lập 1 Batch dữ liệu gồm 2 video: (Batch_Size=2, Seq_Len=15, C=3, H=224, W=224)
-    dummy_input = torch.randn(2, 15, 3, 224, 224)
-    
-    print(f"[INFO] Kích thước Tensor đầu vào: {dummy_input.shape}")
-    
+
     with torch.no_grad():
-        output_logits = model(dummy_input)
-        
-    print(f"[INFO] Kích thước Output Logits: {output_logits.shape}") # (2, 1)
-    print(" Kiểm tra luồng dữ liệu kiến trúc mô hình thành công!")
+
+        output = model(
+            dummy_input
+        )
+
+    print(
+        f"[INFO] Output shape: "
+        f"{output.shape}"
+    )
+
+    print(
+        "[INFO] Kiểm tra mô hình thành công!"
+    )
